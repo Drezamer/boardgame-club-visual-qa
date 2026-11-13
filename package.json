@@ -1,0 +1,13 @@
+{
+  "name": "boardgame-club-visual-qa",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "probe": "node scripts/probe-network.mjs",
+    "capture": "node scripts/capture.mjs",
+    "gallery": "node scripts/build-gallery.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
