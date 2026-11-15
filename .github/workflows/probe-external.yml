@@ -1,0 +1,284 @@
+name: External Network Probe (minimal)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: External runner -> dndclub.ir
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run all probe tests
+        run: |
+          set +e
+          mkdir -p probe-results
+
+          # --- Runner IP (non-fatal) ---
+          RUNNER_IP=""
+          if RUNNER_IP=$(curl -s -m 10 https://api.ipify.org 2>/dev/null) && [ -n "$RUNNER_IP" ]; then
+            :
+          else
+            RUNNER_IP="LOOKUP_FAILED"
+          fi
+          RUN_START_UTC=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+          # --- DNS: IPv4 and IPv6 recorded separately ---
+          DNS_A=$(getent ahostsv4 dndclub.ir 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ',' | sed 's/,$//')
+          [ -z "$DNS_A" ] && DNS_A="FAILED"
+
+          DNS_AAAA_RAW=$(getent ahostsv6 dndclub.ir 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ',' | sed 's/,$//')
+          if [ -z "$DNS_AAAA_RAW" ]; then
+            DNS_AAAA="NO_SYSTEM_RESOLVER_RESULT"
+            DNS_AAAA_STATUS="UNKNOWN (system resolver returned nothing; this does NOT prove that AAAA is absent)"
+          else
+            DNS_AAAA="$DNS_AAAA_RAW"
+            DNS_AAAA_STATUS="RESOLVED_BY_SYSTEM_RESOLVER"
+          fi
+
+          # --- TCP connectivity ---
+          TCP_443="FAILED"
+          if timeout 10 bash -c "echo > /dev/tcp/dndclub.ir/443" 2>/dev/null; then
+            TCP_443="OK"
+          fi
+          TCP_80="FAILED"
+          if timeout 10 bash -c "echo > /dev/tcp/dndclub.ir/80" 2>/dev/null; then
+            TCP_80="OK"
+          fi
+
+          # --- TLS validation: SNI + hostname + chain + timeout (stdout/stderr split) ---
+          : > /tmp/tls_out.txt
+          : > /tmp/tls_err.txt
+          echo | timeout 15 openssl s_client -connect dndclub.ir:443 \
+            -servername dndclub.ir \
+            -verify_hostname dndclub.ir \
+            -verify_return_error > /tmp/tls_out.txt 2> /tmp/tls_err.txt
+          TLS_EXIT=$?
+
+          # Combine for parsing, but keep the two streams on disk separately.
+          cat /tmp/tls_out.txt /tmp/tls_err.txt > /tmp/tls_combined.txt
+
+          # Protocol: OpenSSL 1.1/3.x "Protocol  : TLSv1.3" or "New, TLSv1.3, Cipher is ..."
+          TLS_PROTOCOL=$(grep -oE 'Protocol[[:space:]]*:[[:space:]]*[^[:space:]]+' /tmp/tls_combined.txt 2>/dev/null | head -1 | sed 's/.*:[[:space:]]*//')
+          if [ -z "$TLS_PROTOCOL" ]; then
+            TLS_PROTOCOL=$(grep -oE 'New, [A-Za-z0-9._]+,' /tmp/tls_combined.txt 2>/dev/null | head -1 | sed 's/^New, //; s/,$//')
+          fi
+          [ -z "$TLS_PROTOCOL" ] && TLS_PROTOCOL="UNKNOWN"
+
+          # Cipher: "Cipher    : X" or "Cipher is X"
+          TLS_CIPHER=$(grep -oE 'Cipher[[:space:]]*:[[:space:]]*[^[:space:]]+' /tmp/tls_combined.txt 2>/dev/null | head -1 | sed 's/.*:[[:space:]]*//')
+          if [ -z "$TLS_CIPHER" ]; then
+            TLS_CIPHER=$(grep -oE 'Cipher is [^[:space:]]+' /tmp/tls_combined.txt 2>/dev/null | head -1 | sed 's/^Cipher is //')
+          fi
+          [ -z "$TLS_CIPHER" ] && TLS_CIPHER="UNKNOWN"
+
+          # Verify: "Verify return code: 0 (ok)" or OpenSSL 3.x "Verification: OK"
+          TLS_VERIFY=$(grep -oE 'Verify return code: [0-9]+ \([^)]*\)' /tmp/tls_combined.txt 2>/dev/null | head -1 | sed 's/^Verify return code: //')
+          if [ -z "$TLS_VERIFY" ]; then
+            TLS_VERIFY=$(grep -m1 -E '^Verification: ' /tmp/tls_combined.txt 2>/dev/null | sed 's/^Verification: //')
+          fi
+          [ -z "$TLS_VERIFY" ] && TLS_VERIFY="UNKNOWN"
+
+          # Readable, non-sensitive failure cause (certificates are public data).
+          TLS_ERROR=""
+          if [ "$TLS_EXIT" -ne 0 ]; then
+            TLS_ERROR=$(grep -iE 'verify error|error|alert|failure|unable|refused|errno|connect:|no route|timed out|unknown option|no peer certificate' /tmp/tls_combined.txt 2>/dev/null \
+              | grep -viE '^Verify return code: 0' \
+              | head -3 | tr '\n' ' ' | tr -d '\r' | tr '|' ';' | cut -c1-300)
+            [ -z "$TLS_ERROR" ] && TLS_ERROR="openssl s_client exited with code $TLS_EXIT and printed no diagnostic line"
+          fi
+
+          TLS_CERT=$(echo | timeout 10 openssl s_client -connect dndclub.ir:443 -servername dndclub.ir 2>/dev/null \
+            | openssl x509 -noout -subject -issuer -dates 2>/dev/null)
+          [ -z "$TLS_CERT" ] && TLS_CERT="CERT_DETAILS_UNAVAILABLE"
+
+          # --- IPv6: independent test, honest about unknown state ---
+          IPV6_STATUS="UNKNOWN"
+          IPV6_USED_ADDR=""
+          IPV6_TCP="NOT_TESTED"
+          IPV6_HTTP="NOT_TESTED"
+          if [ "$DNS_AAAA" = "NO_SYSTEM_RESOLVER_RESULT" ]; then
+            IPV6_STATUS="UNKNOWN_NO_SYSTEM_RESOLVER_RESULT"
+            IPV6_TCP="UNKNOWN (system resolver returned no AAAA; absence of AAAA is not proven)"
+            IPV6_HTTP="UNKNOWN (not tested: no AAAA from system resolver)"
+          else
+            IPV6_STATUS="ADDRESS_AVAILABLE"
+            IPV6_USED_ADDR=$(printf '%s' "$DNS_AAAA" | cut -d',' -f1)
+            # Bash /dev/tcp cannot resolve bracketed IPv6 literals -> use a real AF_INET6 socket.
+            IPV6_TCP=$(python3 -c '
+          import socket, sys
+          addr = sys.argv[1]
+          s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+          s.settimeout(10)
+          try:
+              s.connect((addr, 443, 0, 0))
+              print("OK")
+          except Exception as e:
+              print("FAILED: %s: %s" % (type(e).__name__, e))
+              sys.exit(1)
+          finally:
+              s.close()
+          ' "$IPV6_USED_ADDR" 2>&1)
+            IPV6_TCP_EXIT=$?
+            [ -z "$IPV6_TCP" ] && IPV6_TCP="NO_OUTPUT (python exit $IPV6_TCP_EXIT)"
+            IPV6_TCP="$IPV6_TCP (python exit $IPV6_TCP_EXIT)"
+            : > /tmp/ipv6_out.txt
+            : > /tmp/ipv6_err.txt
+            curl -6 --resolve "dndclub.ir:443:[$IPV6_USED_ADDR]" -s -S -o /dev/null \
+              -w "%{http_code}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{size_download}" \
+              --connect-timeout 10 --max-time 15 "https://dndclub.ir/" \
+              > /tmp/ipv6_out.txt 2> /tmp/ipv6_err.txt
+            IPV6_EXIT=$?
+            IPV6_METRICS=$(tr -d '\r\n' < /tmp/ipv6_out.txt)
+            [ -z "$IPV6_METRICS" ] && IPV6_METRICS="NO_WRITE_OUT"
+            IPV6_ERR=$(tr '\r\n' '  ' < /tmp/ipv6_err.txt | tr '|' ';' | cut -c1-300)
+            IPV6_HTTP="addr=$IPV6_USED_ADDR metrics=$IPV6_METRICS exit=$IPV6_EXIT stderr=$IPV6_ERR"
+          fi
+
+          # --- HTTP tests: exactly one request per path+UA, stdout and stderr kept apart ---
+          CHROME_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          CHATGPT_UA="ChatGPT/1.2026.307 (Android 14; 21081111RG; build 2630718)"
+
+          : > /tmp/http_results.txt
+          : > probe-results/curl-stderr.log
+          for ua_label in "CHROME" "CHATGPT"; do
+            if [ "$ua_label" = "CHROME" ]; then
+              UA="$CHROME_UA"
+            else
+              UA="$CHATGPT_UA"
+            fi
+            for path in "/" "/robots.txt" "/2024/" "/bgg/"; do
+              : > /tmp/curl_out.txt
+              : > /tmp/curl_err.txt
+              curl -4 -s -S -o /dev/null \
+                -w "%{http_code}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{size_download}" \
+                --connect-timeout 10 --max-time 15 -A "$UA" "https://dndclub.ir$path" \
+                > /tmp/curl_out.txt 2> /tmp/curl_err.txt
+              CURL_EXIT=$?
+
+              METRICS=$(tr -d '\r\n' < /tmp/curl_out.txt)
+              [ -z "$METRICS" ] && METRICS="000|0|0|0|0|0"
+
+              # stderr kept verbatim in its own file, sanitized (no '|', no newline) for the record
+              {
+                echo "### ua=$ua_label path=$path exit=$CURL_EXIT"
+                cat /tmp/curl_err.txt
+              } >> probe-results/curl-stderr.log
+
+              STDERR_TXT=$(tr '\r\n' '  ' < /tmp/curl_err.txt | tr '|' ';' | tr -s ' ' | cut -c1-300)
+
+              echo "$ua_label|$UA|$path|$METRICS|$CURL_EXIT|$STDERR_TXT" >> /tmp/http_results.txt
+            done
+          done
+
+          RUN_END_UTC=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+          # --- Write human-readable output ---
+          {
+            echo "PROBE_START_UTC=$RUN_START_UTC"
+            echo "RUNNER_IP=$RUNNER_IP"
+            echo "PROBE_END_UTC=$RUN_END_UTC"
+            echo ""
+            echo "=== DNS A (IPv4) ==="
+            echo "Addresses: $DNS_A"
+            echo ""
+            echo "=== DNS AAAA (IPv6) ==="
+            echo "Addresses: $DNS_AAAA"
+            echo "Status: $DNS_AAAA_STATUS"
+            echo ""
+            echo "=== TCP port 443 ==="
+            echo "$TCP_443"
+            echo ""
+            echo "=== TCP port 80 ==="
+            echo "$TCP_80"
+            echo ""
+            echo "=== TLS (SNI + verify_hostname + verify_return_error) ==="
+            echo "Protocol: $TLS_PROTOCOL"
+            echo "Cipher: $TLS_CIPHER"
+            echo "Verify: $TLS_VERIFY"
+            echo "Exit code: $TLS_EXIT"
+            echo "Error: $TLS_ERROR"
+            echo "$TLS_CERT"
+            echo ""
+            echo "=== IPv6 (independent test) ==="
+            echo "Status: $IPV6_STATUS"
+            echo "Address used: $IPV6_USED_ADDR"
+            echo "TCP 443: $IPV6_TCP"
+            echo "HTTP: $IPV6_HTTP"
+            echo ""
+            echo "=== HTTP Results (one request per path+UA) ==="
+            echo "format: ua_label|user_agent|path|http_code|connect_s|tls_s|ttfb_s|total_s|size_bytes|curl_exit|stderr"
+            cat /tmp/http_results.txt
+            echo ""
+            echo "=== curl stderr (raw, per request) ==="
+            cat probe-results/curl-stderr.log
+          } > probe-results/probe-output.txt
+
+          # --- Build JSON output ---
+          export RUNNER_IP DNS_A DNS_AAAA DNS_AAAA_STATUS TCP_443 TCP_80 \
+                 TLS_PROTOCOL TLS_CIPHER TLS_VERIFY TLS_EXIT TLS_ERROR \
+                 RUN_START_UTC RUN_END_UTC IPV6_STATUS IPV6_USED_ADDR IPV6_TCP IPV6_HTTP
+          # JSON builder payload (base64, chunked for readability).
+          # Decoded sha256: 8e4510cabc29c47a9db5c055fe5c18f9338c2d260acecb5bc78aff6d1567317c
+          : > /tmp/build_json.b64
+          echo "aW1wb3J0IGpzb24sIG9zCgpkZWYgc2FmZV9zcGxpdChzLCBzZXA9IiwiKToKICAgIGlmIG5vdCBz" >> /tmp/build_json.b64
+          echo "IG9yIHMgaW4gKCJGQUlMRUQiLCAiTk9ORSIsICJOL0EiLCAiTk9fU1lTVEVNX1JFU09MVkVSX1JF" >> /tmp/build_json.b64
+          echo "U1VMVCIpOgogICAgICAgIHJldHVybiBbXQogICAgcmV0dXJuIFt4LnN0cmlwKCkgZm9yIHggaW4g" >> /tmp/build_json.b64
+          echo "cy5zcGxpdChzZXApIGlmIHguc3RyaXAoKV0KCmh0dHBfcmVzdWx0cyA9IFtdCmh0dHBfZmlsZSA9" >> /tmp/build_json.b64
+          echo "ICIvdG1wL2h0dHBfcmVzdWx0cy50eHQiCmlmIG9zLnBhdGguZXhpc3RzKGh0dHBfZmlsZSk6CiAg" >> /tmp/build_json.b64
+          echo "ICB3aXRoIG9wZW4oaHR0cF9maWxlKSBhcyBmOgogICAgICAgIGZvciBsaW5lIGluIGY6CiAgICAg" >> /tmp/build_json.b64
+          echo "ICAgICAgIGxpbmUgPSBsaW5lLnJzdHJpcCgiXG4iKQogICAgICAgICAgICBpZiBub3QgbGluZS5z" >> /tmp/build_json.b64
+          echo "dHJpcCgpOgogICAgICAgICAgICAgICAgY29udGludWUKICAgICAgICAgICAgcGFydHMgPSBsaW5l" >> /tmp/build_json.b64
+          echo "LnNwbGl0KCJ8IikKICAgICAgICAgICAgd2hpbGUgbGVuKHBhcnRzKSA8IDExOgogICAgICAgICAg" >> /tmp/build_json.b64
+          echo "ICAgICAgcGFydHMuYXBwZW5kKCIiKQogICAgICAgICAgICBodHRwX3Jlc3VsdHMuYXBwZW5kKHsK" >> /tmp/build_json.b64
+          echo "ICAgICAgICAgICAgICAgICJ1YV9sYWJlbCI6IHBhcnRzWzBdLAogICAgICAgICAgICAgICAgInVz" >> /tmp/build_json.b64
+          echo "ZXJfYWdlbnQiOiBwYXJ0c1sxXSwKICAgICAgICAgICAgICAgICJwYXRoIjogcGFydHNbMl0sCiAg" >> /tmp/build_json.b64
+          echo "ICAgICAgICAgICAgICAiaHR0cF9jb2RlIjogcGFydHNbM10sCiAgICAgICAgICAgICAgICAiY29u" >> /tmp/build_json.b64
+          echo "bmVjdF9zIjogcGFydHNbNF0sCiAgICAgICAgICAgICAgICAidGxzX3MiOiBwYXJ0c1s1XSwKICAg" >> /tmp/build_json.b64
+          echo "ICAgICAgICAgICAgICJ0dGZiX3MiOiBwYXJ0c1s2XSwKICAgICAgICAgICAgICAgICJ0b3RhbF9z" >> /tmp/build_json.b64
+          echo "IjogcGFydHNbN10sCiAgICAgICAgICAgICAgICAic2l6ZV9ieXRlcyI6IHBhcnRzWzhdLAogICAg" >> /tmp/build_json.b64
+          echo "ICAgICAgICAgICAgImN1cmxfZXhpdCI6IHBhcnRzWzldLAogICAgICAgICAgICAgICAgInN0ZGVy" >> /tmp/build_json.b64
+          echo "ciI6IHBhcnRzWzEwXSwKICAgICAgICAgICAgfSkKCmRhdGEgPSB7CiAgICAicHJvYmVfc3RhcnRf" >> /tmp/build_json.b64
+          echo "dXRjIjogb3MuZW52aXJvbi5nZXQoIlJVTl9TVEFSVF9VVEMiLCAiIiksCiAgICAicHJvYmVfZW5k" >> /tmp/build_json.b64
+          echo "X3V0YyI6IG9zLmVudmlyb24uZ2V0KCJSVU5fRU5EX1VUQyIsICIiKSwKICAgICJydW5uZXJfaXAi" >> /tmp/build_json.b64
+          echo "OiBvcy5lbnZpcm9uLmdldCgiUlVOTkVSX0lQIiwgIiIpLAogICAgImRucyI6IHsKICAgICAgICAi" >> /tmp/build_json.b64
+          echo "aXB2NCI6IHNhZmVfc3BsaXQob3MuZW52aXJvbi5nZXQoIkROU19BIiwgIiIpKSwKICAgICAgICAi" >> /tmp/build_json.b64
+          echo "aXB2NiI6IHNhZmVfc3BsaXQob3MuZW52aXJvbi5nZXQoIkROU19BQUFBIiwgIiIpKSwKICAgICAg" >> /tmp/build_json.b64
+          echo "ICAiaXB2Nl9zdGF0dXMiOiBvcy5lbnZpcm9uLmdldCgiRE5TX0FBQUEiLCAiIiksCiAgICAgICAg" >> /tmp/build_json.b64
+          echo "ImlwdjZfc3RhdHVzX25vdGUiOiBvcy5lbnZpcm9uLmdldCgiRE5TX0FBQUFfU1RBVFVTIiwgIiIp" >> /tmp/build_json.b64
+          echo "LAogICAgfSwKICAgICJ0Y3AiOiB7CiAgICAgICAgInBvcnRfNDQzIjogb3MuZW52aXJvbi5nZXQo" >> /tmp/build_json.b64
+          echo "IlRDUF80NDMiLCAiIiksCiAgICAgICAgInBvcnRfODAiOiBvcy5lbnZpcm9uLmdldCgiVENQXzgw" >> /tmp/build_json.b64
+          echo "IiwgIiIpLAogICAgfSwKICAgICJ0bHMiOiB7CiAgICAgICAgInByb3RvY29sIjogb3MuZW52aXJv" >> /tmp/build_json.b64
+          echo "bi5nZXQoIlRMU19QUk9UT0NPTCIsICIiKSwKICAgICAgICAiY2lwaGVyIjogb3MuZW52aXJvbi5n" >> /tmp/build_json.b64
+          echo "ZXQoIlRMU19DSVBIRVIiLCAiIiksCiAgICAgICAgInZlcmlmeSI6IG9zLmVudmlyb24uZ2V0KCJU" >> /tmp/build_json.b64
+          echo "TFNfVkVSSUZZIiwgIiIpLAogICAgICAgICJ2ZXJpZnlfaG9zdG5hbWVfdXNlZCI6ICJkbmRjbHVi" >> /tmp/build_json.b64
+          echo "LmlyIiwKICAgICAgICAidmVyaWZ5X3JldHVybl9lcnJvcl91c2VkIjogVHJ1ZSwKICAgICAgICAi" >> /tmp/build_json.b64
+          echo "ZXhpdF9jb2RlIjogb3MuZW52aXJvbi5nZXQoIlRMU19FWElUIiwgIiIpLAogICAgICAgICJlcnJv" >> /tmp/build_json.b64
+          echo "ciI6IG9zLmVudmlyb24uZ2V0KCJUTFNfRVJST1IiLCAiIiksCiAgICB9LAogICAgImlwdjZfaW5k" >> /tmp/build_json.b64
+          echo "ZXBlbmRlbnQiOiB7CiAgICAgICAgInN0YXR1cyI6IG9zLmVudmlyb24uZ2V0KCJJUFY2X1NUQVRV" >> /tmp/build_json.b64
+          echo "UyIsICIiKSwKICAgICAgICAidXNlZF9hZGRyZXNzIjogb3MuZW52aXJvbi5nZXQoIklQVjZfVVNF" >> /tmp/build_json.b64
+          echo "RF9BRERSIiwgIiIpLAogICAgICAgICJ0Y3BfNDQzIjogb3MuZW52aXJvbi5nZXQoIklQVjZfVENQ" >> /tmp/build_json.b64
+          echo "IiwgIiIpLAogICAgICAgICJodHRwIjogb3MuZW52aXJvbi5nZXQoIklQVjZfSFRUUCIsICIiKSwK" >> /tmp/build_json.b64
+          echo "ICAgIH0sCiAgICAiaHR0cCI6IGh0dHBfcmVzdWx0cywKfQoKd2l0aCBvcGVuKCJwcm9iZS1yZXN1" >> /tmp/build_json.b64
+          echo "bHRzL3Byb2JlLXJlc3VsdHMuanNvbiIsICJ3IikgYXMgZjoKICAgIGpzb24uZHVtcChkYXRhLCBm" >> /tmp/build_json.b64
+          echo "LCBpbmRlbnQ9MiwgZW5zdXJlX2FzY2lpPUZhbHNlKQo=" >> /tmp/build_json.b64
+          base64 -d < /tmp/build_json.b64 > /tmp/build_json.py
+          if ! python3 /tmp/build_json.py; then
+            printf '{"error":"json_builder_failed","note":"text output is still complete"}\n' > probe-results/probe-results.json
+          fi
+
+          # --- Display output ---
+          cat probe-results/probe-output.txt
+          echo ""
+          echo "=== JSON output ==="
+          cat probe-results/probe-results.json
+
+      - name: Upload probe results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-probe-results
+          path: probe-results/
+          retention-days: 14
