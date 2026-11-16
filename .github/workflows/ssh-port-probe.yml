@@ -1,0 +1,94 @@
+name: SSH Port TCP Probe (read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: GitHub runner -> cip29.mizbanfadns.net:8340
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run TCP/DNS probe
+        run: |
+          set +e
+          mkdir -p probe-results
+          : > probe-results/probe-output.txt
+
+          RUNNER_IP=""
+          if RUNNER_IP=$(curl -s -m 10 https://api.ipify.org 2>/dev/null) && [ -n "$RUNNER_IP" ]; then
+            :
+          else
+            RUNNER_IP="LOOKUP_FAILED"
+          fi
+          START_UTC=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+          {
+            echo "RUNNER_IP=$RUNNER_IP"
+            echo "START_UTC=$START_UTC"
+            echo "TARGET_HOST=cip29.mizbanfadns.net"
+            echo "TARGET_IP=88.135.68.29"
+            echo "TARGET_PORT=8340"
+          } | tee -a probe-results/probe-output.txt
+
+          echo "=== DNS: cip29.mizbanfadns.net (IPv4) ===" | tee -a probe-results/probe-output.txt
+          getent ahostsv4 cip29.mizbanfadns.net 2>/dev/null | tee -a probe-results/probe-output.txt
+          echo "---" | tee -a probe-results/probe-output.txt
+
+          echo "=== nc cross-check: hostname:8340 ===" | tee -a probe-results/probe-output.txt
+          nc -vz -w 8 cip29.mizbanfadns.net 8340 2>&1 | tee -a probe-results/probe-output.txt
+          echo "nc exit (hostname): $?" | tee -a probe-results/probe-output.txt
+
+          echo "=== nc cross-check: ip:8340 ===" | tee -a probe-results/probe-output.txt
+          nc -vz -w 8 88.135.68.29 8340 2>&1 | tee -a probe-results/probe-output.txt
+          echo "nc exit (ip): $?" | tee -a probe-results/probe-output.txt
+
+          python3 -c '
+import socket, time, json, os, urllib.request
+def resolve(host):
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET)
+        return sorted({i[4][0] for i in infos})
+    except Exception as e:
+        return {"error": str(e)}
+def tcp(host, port, timeout=8):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    t0 = time.time()
+    try:
+        s.connect((host, port))
+        ms = round((time.time() - t0) * 1000, 1)
+        return {"result": "OPEN", "ms": ms, "error": None}
+    except Exception as e:
+        ms = round((time.time() - t0) * 1000, 1)
+        return {"result": "FAILED", "ms": ms, "error": "%s: %s" % (type(e).__name__, e)}
+    finally:
+        s.close()
+out = {}
+try:
+    out["runner_ip"] = urllib.request.urlopen("https://api.ipify.org", timeout=10).read().decode().strip()
+except Exception as e:
+    out["runner_ip"] = "LOOKUP_FAILED: %s" % e
+out["start_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+out["dns_hostname"] = resolve("cip29.mizbanfadns.net")
+out["tcp_hostname_8340"] = tcp("cip29.mizbanfadns.net", 8340)
+out["tcp_ip_8340"] = tcp("88.135.68.29", 8340)
+out["end_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+os.makedirs("probe-results", exist_ok=True)
+with open("probe-results/ssh-port-probe.json", "w") as f:
+    json.dump(out, f, indent=2)
+print(json.dumps(out, indent=2))
+' 2>&1 | tee -a probe-results/probe-output.txt
+
+          END_UTC=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          echo "END_UTC=$END_UTC" | tee -a probe-results/probe-output.txt
+
+      - name: Upload probe results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-port-probe-results
+          path: probe-results/
+          retention-days: 14
