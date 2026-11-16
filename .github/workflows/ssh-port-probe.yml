@@ -11,79 +11,115 @@ jobs:
     name: GitHub runner -> cip29.mizbanfadns.net:8340
     runs-on: ubuntu-latest
     steps:
-      - name: Run TCP/DNS probe
+      - name: Run DNS and TCP probe
+        shell: bash
         run: |
           set +e
           mkdir -p probe-results
-          : > probe-results/probe-output.txt
 
-          RUNNER_IP=""
-          if RUNNER_IP=$(curl -s -m 10 https://api.ipify.org 2>/dev/null) && [ -n "$RUNNER_IP" ]; then
-            :
+          HOST="cip29.mizbanfadns.net"
+          TARGET_IP="88.135.68.29"
+          PORT="8340"
+          START_UTC="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          RUNNER_IP="LOOKUP_FAILED"
+          IP_LOOKUP_ERROR=""
+          if IP_RESULT=$(curl -4 -fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>probe-results/ip-lookup-stderr.txt) && [[ "$IP_RESULT" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            RUNNER_IP="$IP_RESULT"
           else
-            RUNNER_IP="LOOKUP_FAILED"
+            IP_LOOKUP_ERROR="$(tr '\r\n' '  ' < probe-results/ip-lookup-stderr.txt | cut -c1-300)"
           fi
-          START_UTC=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 
           {
-            echo "RUNNER_IP=$RUNNER_IP"
-            echo "START_UTC=$START_UTC"
-            echo "TARGET_HOST=cip29.mizbanfadns.net"
-            echo "TARGET_IP=88.135.68.29"
-            echo "TARGET_PORT=8340"
-          } | tee -a probe-results/probe-output.txt
+            echo "=== Probe metadata ==="
+            printf 'RUNNER_IP=%s\nSTART_UTC=%s\nHOST=%s\nTARGET_IP=%s\nPORT=%s\n' \
+              "$RUNNER_IP" "$START_UTC" "$HOST" "$TARGET_IP" "$PORT"
+            [[ -n "$IP_LOOKUP_ERROR" ]] && echo "IP_LOOKUP_ERROR=$IP_LOOKUP_ERROR"
+            echo
+            echo "=== DNS: $HOST (IPv4) ==="
+          } | tee probe-results/probe-output.txt
 
-          echo "=== DNS: cip29.mizbanfadns.net (IPv4) ===" | tee -a probe-results/probe-output.txt
-          getent ahostsv4 cip29.mizbanfadns.net 2>/dev/null | tee -a probe-results/probe-output.txt
-          echo "---" | tee -a probe-results/probe-output.txt
+          DNS_OUTPUT="$(getent ahostsv4 "$HOST" 2>&1)"
+          DNS_EXIT=$?
+          printf '%s\nDNS_EXIT=%s\n' "${DNS_OUTPUT:-NO_RESULT}" "$DNS_EXIT" | tee -a probe-results/probe-output.txt
 
-          echo "=== nc cross-check: hostname:8340 ===" | tee -a probe-results/probe-output.txt
-          nc -vz -w 8 cip29.mizbanfadns.net 8340 2>&1 | tee -a probe-results/probe-output.txt
-          echo "nc exit (hostname): $?" | tee -a probe-results/probe-output.txt
+          echo | tee -a probe-results/probe-output.txt
+          echo "=== Netcat cross-check: hostname:$PORT ===" | tee -a probe-results/probe-output.txt
+          nc -vz -w 8 "$HOST" "$PORT" >probe-results/nc-host.txt 2>&1
+          NC_HOST_EXIT=$?
+          cat probe-results/nc-host.txt | tee -a probe-results/probe-output.txt
+          echo "NC_HOST_EXIT=$NC_HOST_EXIT" | tee -a probe-results/probe-output.txt
 
-          echo "=== nc cross-check: ip:8340 ===" | tee -a probe-results/probe-output.txt
-          nc -vz -w 8 88.135.68.29 8340 2>&1 | tee -a probe-results/probe-output.txt
-          echo "nc exit (ip): $?" | tee -a probe-results/probe-output.txt
+          echo | tee -a probe-results/probe-output.txt
+          echo "=== Netcat cross-check: $TARGET_IP:$PORT ===" | tee -a probe-results/probe-output.txt
+          nc -vz -w 8 "$TARGET_IP" "$PORT" >probe-results/nc-ip.txt 2>&1
+          NC_IP_EXIT=$?
+          cat probe-results/nc-ip.txt | tee -a probe-results/probe-output.txt
+          echo "NC_IP_EXIT=$NC_IP_EXIT" | tee -a probe-results/probe-output.txt
 
-          python3 -c '
-import socket, time, json, os, urllib.request
-def resolve(host):
-    try:
-        infos = socket.getaddrinfo(host, None, socket.AF_INET)
-        return sorted({i[4][0] for i in infos})
-    except Exception as e:
-        return {"error": str(e)}
-def tcp(host, port, timeout=8):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    t0 = time.time()
-    try:
-        s.connect((host, port))
-        ms = round((time.time() - t0) * 1000, 1)
-        return {"result": "OPEN", "ms": ms, "error": None}
-    except Exception as e:
-        ms = round((time.time() - t0) * 1000, 1)
-        return {"result": "FAILED", "ms": ms, "error": "%s: %s" % (type(e).__name__, e)}
-    finally:
-        s.close()
-out = {}
-try:
-    out["runner_ip"] = urllib.request.urlopen("https://api.ipify.org", timeout=10).read().decode().strip()
-except Exception as e:
-    out["runner_ip"] = "LOOKUP_FAILED: %s" % e
-out["start_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-out["dns_hostname"] = resolve("cip29.mizbanfadns.net")
-out["tcp_hostname_8340"] = tcp("cip29.mizbanfadns.net", 8340)
-out["tcp_ip_8340"] = tcp("88.135.68.29", 8340)
-out["end_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-os.makedirs("probe-results", exist_ok=True)
-with open("probe-results/ssh-port-probe.json", "w") as f:
-    json.dump(out, f, indent=2)
-print(json.dumps(out, indent=2))
-' 2>&1 | tee -a probe-results/probe-output.txt
+          echo | tee -a probe-results/probe-output.txt
+          echo "=== Python socket probe (authoritative result) ===" | tee -a probe-results/probe-output.txt
+          export PROBE_HOST="$HOST" PROBE_IP="$TARGET_IP" PROBE_PORT="$PORT" PROBE_RUNNER_IP="$RUNNER_IP" PROBE_START_UTC="$START_UTC"
+          python3 - <<'PYTHON' >probe-results/ssh-port-probe.json 2>probe-results/python-stderr.txt
+          import json, os, socket, time
 
-          END_UTC=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-          echo "END_UTC=$END_UTC" | tee -a probe-results/probe-output.txt
+          host = os.environ["PROBE_HOST"]
+          target_ip = os.environ["PROBE_IP"]
+          port = int(os.environ["PROBE_PORT"])
+          timeout = 8.0
+
+          def resolve_ipv4(name):
+              started = time.monotonic()
+              try:
+                  infos = socket.getaddrinfo(name, port, socket.AF_INET, socket.SOCK_STREAM)
+                  addresses = sorted({item[4][0] for item in infos})
+                  return {"result": "OK" if addresses else "NO_RESULT", "addresses": addresses,
+                          "elapsed_ms": round((time.monotonic() - started) * 1000, 1), "error": None}
+              except Exception as exc:
+                  return {"result": "FAILED", "addresses": [],
+                          "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                          "error": f"{type(exc).__name__}: {exc}"}
+
+          def tcp_connect(address, label):
+              started = time.monotonic()
+              try:
+                  with socket.create_connection((address, port), timeout=timeout):
+                      return {"target": label, "address": address, "result": "OPEN",
+                              "elapsed_ms": round((time.monotonic() - started) * 1000, 1), "error": None}
+              except Exception as exc:
+                  return {"target": label, "address": address, "result": "FAILED",
+                          "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                          "error": f"{type(exc).__name__}: {exc}"}
+
+          data = {
+              "runner_ip": os.environ.get("PROBE_RUNNER_IP", "LOOKUP_FAILED"),
+              "start_utc": os.environ.get("PROBE_START_UTC", ""),
+              "host": host,
+              "target_ip": target_ip,
+              "port": port,
+              "timeout_seconds": timeout,
+              "dns_hostname_ipv4": resolve_ipv4(host),
+              "tcp_hostname": None,
+              "tcp_direct_ip": tcp_connect(target_ip, "direct_ip"),
+          }
+
+          dns = data["dns_hostname_ipv4"]
+          if dns["addresses"]:
+              data["tcp_hostname"] = [tcp_connect(addr, "hostname_resolved_ipv4") for addr in dns["addresses"]]
+          else:
+              data["tcp_hostname"] = {"result": "NOT_TESTED", "reason": "No IPv4 address resolved"}
+
+          data["end_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+          print(json.dumps(data, indent=2))
+          PYTHON
+          PY_EXIT=$?
+          echo "Python probe exit: $PY_EXIT" | tee -a probe-results/probe-output.txt
+          if [[ -s probe-results/ssh-port-probe.json ]]; then
+            cat probe-results/ssh-port-probe.json | tee -a probe-results/probe-output.txt
+          else
+            echo "Python probe did not produce JSON." | tee -a probe-results/probe-output.txt
+            cat probe-results/python-stderr.txt | tee -a probe-results/probe-output.txt
+          fi
 
       - name: Upload probe results
         if: always()
